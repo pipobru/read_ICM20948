@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "spi_custom.h"
+//#include "AK09916.h"
 
 /* ================================================================== */
 /* REGISTRES                                                           */
@@ -25,6 +26,8 @@
 #define ICM20948_FIFO_COUNTL   0x71
 #define ICM20948_FIFO_R_W      0x72
 #define REG_BANK_SEL           0x7F
+#define ICM20948_I2C_MST_STATUS     0x17
+#define ICM20948_EXT_SLV_SENS_DATA_00  0x3B
 
 /* Bank 2 */
 #define ICM20948_GYRO_SMPLRT_DIV   0x00
@@ -32,6 +35,8 @@
 #define ICM20948_ACCEL_SMPLRT_DIV1 0x10
 #define ICM20948_ACCEL_SMPLRT_DIV2 0x11
 #define ICM20948_ACCEL_CONFIG      0x14
+
+
 
 /* ================================================================== */
 /* CONSTANTES                                                          */
@@ -58,6 +63,9 @@
 /* USER_CTRL */
 #define USER_CTRL_FIFO_EN      (1 << 6)
 #define USER_CTRL_FIFO_RST     (1 << 2)
+#define USER_CTRL_I2C_MST_EN    (1 << 5)
+#define USER_CTRL_I2C_IF_DIS    (1 << 4)  /* obligatoire en mode SPI */
+#define USER_CTRL_I2C_MST_RST   (1 << 1)
 
 /* FIFO_EN_2 */
 /*
@@ -71,6 +79,7 @@
 #define FIFO_EN2_GYRO_Y        (1 << 2)
 #define FIFO_EN2_GYRO_X        (1 << 1)
 #define FIFO_EN2_TEMP_FIFO     (1 << 0)
+#define FIFO_EN1_SLV0           (1 << 0) /* compass via SLV0 → FIFO */
 
 /* GYRO_CONFIG_1 */
 #define GYRO_FCHOICE_ENABLE    (1 << 0)
@@ -100,14 +109,51 @@
 #define ACCEL_DLPF_6HZ         (6 << 3)
 
 /* Taille paquet FIFO */
-#define FIFO_PACKET_SIZE       14   /* accel(6) + gyro(6) + temp*/
-#define FIFO_MAX_PACKETS       36   /* 512 / 14           */
+//#define FIFO_PACKET_SIZE       14   /* accel(6) + gyro(6) + temp*/
+#define FIFO_PACKET_SIZE       22   /* accel(6)+gyro(6)+ST1(1)+mag(6)+ST2(1)+temp */
+#define FIFO_MAX_PACKETS       23   /* 512 / 22           */
 
+/* ================================================================== */
+/* AK09916                                                             */
+/* ================================================================== */
+#define AK09916_I2C_ADDR        0x0C
+#define AK09916_WIA1            0x00   /* Company ID = 0x48 */
+#define AK09916_WIA2            0x01   /* Device ID  = 0x09 */
+#define AK09916_ST1             0x10   /* Status 1 (DRDY)   */
+#define AK09916_HXL             0x11   /* Mag X LSB         */
+#define AK09916_ST2             0x18   /* Status 2 (HOFL)   */
+#define AK09916_CNTL2           0x31   /* Mode de mesure    */
+#define AK09916_CNTL3           0x32   /* Reset soft        */
+
+#define AK09916_MODE_POWERDOWN  0x00
+#define AK09916_MODE_CONT_10HZ  0x02
+#define AK09916_MODE_CONT_20HZ  0x04
+#define AK09916_MODE_CONT_50HZ  0x06
+#define AK09916_MODE_CONT_100HZ 0x08
+
+/* SLV0 lit ST1+HX+HY+HZ+ST2 = 8 octets depuis AK09916_ST1 */
+#define AK09916_SLV0_LEN        8
+
+/* Bank 3 */
+#define ICM20948_I2C_MST_ODR_CFG    0x00
+#define ICM20948_I2C_MST_CTRL       0x01
+#define ICM20948_I2C_MST_DELAY_CTRL 0x02
+#define ICM20948_I2C_SLV0_ADDR      0x03
+#define ICM20948_I2C_SLV0_REG       0x04
+#define ICM20948_I2C_SLV0_CTRL      0x05
+#define ICM20948_I2C_SLV0_DO        0x06
+
+
+static int icm20948_set_bank(spi_device_t *spi, uint8_t bank);
 
 /* ── Structure d'un sample ───────────────────────────────────────── */
 typedef struct {
-    int16_t accel_x, accel_y, accel_z;
-    int16_t gyro_x,  gyro_y,  gyro_z;
+    int16_t accel_x, accel_y, accel_z;  //Accelerateur en g
+    int16_t gyro_x,  gyro_y,  gyro_z;   //Gyroscope en vitesse angulaire en °/s
+    int16_t mag_x,   mag_y,   mag_z;    //Magnétomètre en µT
+    uint8_t mag_st1;               /* bit0=DRDY                  */
+    uint8_t mag_st2;               /* bit3=HOFL (overflow)       */
+    uint8_t mag_valid;             /* 1 si DRDY=1 et HOFL=0      */
     int16_t temp;
 } icm20948_sample_t;
 
@@ -322,9 +368,19 @@ static int init_power(spi_device_t *spi)
                            PWR_MGMT2_ALL_ON) < 0)
         return -1;
 
-    usleep(30000);  /* 30 ms — stabilisation */
+/*
+     * I2C_IF_DIS (bit4) : désactive l'interface I2C principale
+     * OBLIGATOIRE en mode SPI → libère le bus auxiliaire pour
+     * le I2C master interne (AK09916)
+     * Ce bit doit être conservé dans TOUS les écritures USER_CTRL
+     */
+    if (icm20948_write_reg(spi, ICM20948_USER_CTRL,
+                           USER_CTRL_I2C_IF_DIS) < 0)
+        return -1;
+    usleep(10000);
 
-    printf("[INIT] Power OK (accel + gyro actifs)\n");
+    printf("[INIT] Power OK — USER_CTRL=0x%02X "
+           "(I2C_IF_DIS actif)\n", USER_CTRL_I2C_IF_DIS);
     return 0;
 }
 
@@ -445,44 +501,65 @@ static int init_fifo(spi_device_t *spi, const icm20948_config_t *cfg)
     /* Vérifier reset relâché */
     icm20948_read_reg(spi, ICM20948_FIFO_RST, &val);
     if (val != 0x00) {
-        fprintf(stderr, "FIFO_RST non relâché\n");
+        fprintf(stderr, "[INIT] FIFO_RST non relâché : 0x%02X\n", val);
         return -1;
     }
 
-    /* ── Étape 4 : mode FIFO ── */
+    /* ── 4. Mode stream (overwrite) ── */
     icm20948_write_reg(spi, ICM20948_FIFO_MODE,
                        cfg->fifo_mode ? 0x1F : 0x00);
 
-    /* ── Étape 5 : activer FIFO dans USER_CTRL ── */
-    icm20948_write_reg(spi, ICM20948_USER_CTRL, USER_CTRL_FIFO_EN);
+
+    /* ── 5. Activer FIFO en préservant I2C_IF_DIS + I2C_MST_EN ── */
+    icm20948_read_reg(spi, ICM20948_USER_CTRL, &val);
+    val |= USER_CTRL_FIFO_EN
+        |  USER_CTRL_I2C_MST_EN
+        |  USER_CTRL_I2C_IF_DIS;
+    icm20948_write_reg(spi, ICM20948_USER_CTRL, val);
     usleep(1000);
 
-    /* ── Étape 6 : connecter les sources ── */
-    icm20948_write_reg(spi, ICM20948_FIFO_EN_1, 0x00);
+/* ── 6. Connecter les sources ── */
+    /*
+     * FIFO_EN_2 : accel + gyroX/Y/Z   (capteurs internes)
+     * FIFO_EN_1 : SLV0               (compass via I2C master)
+     */
     icm20948_write_reg(spi, ICM20948_FIFO_EN_2,
-                        FIFO_EN2_TEMP_FIFO |
+                       FIFO_EN2_TEMP_FIFO |
                        FIFO_EN2_GYRO_X |
                        FIFO_EN2_GYRO_Y |
                        FIFO_EN2_GYRO_Z |
                        FIFO_EN2_ACCEL);
 
-    /* ── Étape 7 : attendre au moins 1 sample ── */
-    usleep(20000);  /* 20 ms > 1 période à 100 Hz */
+    icm20948_write_reg(spi, ICM20948_FIFO_EN_1,
+                       FIFO_EN1_SLV0);
 
-    /* ── Vérification ── */
+    /* ── 7. Attendre au moins 2 samples ── */
+    usleep(30000);  /* 30 ms > 2 × 1/100Hz × 1000 */
+
+    /* ── 8. Vérifier compteur FIFO ── */
     uint8_t h, l;
     icm20948_read_reg(spi, ICM20948_FIFO_COUNTH, &h);
     icm20948_read_reg(spi, ICM20948_FIFO_COUNTL, &l);
     uint16_t count = ((uint16_t)h << 8) | l;
 
-    if (count == 0) {
-        fprintf(stderr, "FIFO toujours vide après init !\n");
-        icm20948_fifo_debug(spi);
+    if (count < FIFO_PACKET_SIZE) {
+        fprintf(stderr, "[INIT] FIFO vide après init : %u octets\n", count);
         return -1;
     }
 
-    printf("[INIT] FIFO OK : %u octets (%u samples) disponibles\n",
-           count, count / FIFO_PACKET_SIZE);
+    /* Vérifier cohérence : multiple de FIFO_PACKET_SIZE */
+    if (count % FIFO_PACKET_SIZE != 0) {
+        fprintf(stderr, "[INIT] FIFO désaligné : %u octets "
+                "(paquet=%d)\n", count, FIFO_PACKET_SIZE);
+        /* Reset pour réaligner */
+        icm20948_write_reg(spi, ICM20948_FIFO_RST, 0x1F);
+        usleep(1000);
+        icm20948_write_reg(spi, ICM20948_FIFO_RST, 0x00);
+    }
+
+    printf("[INIT] FIFO OK : %u octets — %u samples "
+           "(%d octets/sample) ✓\n",
+           count, count / FIFO_PACKET_SIZE, FIFO_PACKET_SIZE);
     return 0;
 }
 
@@ -527,27 +604,19 @@ int icm20948_fifo_read(spi_device_t *spi,
                        int max_samples,
                        int *nb_read)
 {
-    uint16_t count  = 0;
-    int      n      = 0;
-
+uint8_t h, l;
     *nb_read = 0;
 
     icm20948_set_bank(spi, BANK_0);
 
-    /* Nombre d'octets dans le FIFO */
-    if (icm20948_fifo_count(spi, &count) < 0)
-        return -1;
+    icm20948_read_reg(spi, ICM20948_FIFO_COUNTH, &h);
+    icm20948_read_reg(spi, ICM20948_FIFO_COUNTL, &l);
+    uint16_t count = ((uint16_t)h << 8) | l;
 
-    if (count == 0 || count < FIFO_PACKET_SIZE) {
-        return 0;   /* Pas encore assez de données */
-    }
+    int n = count / FIFO_PACKET_SIZE;
+    if (n == 0)  return 0;
+    if (n > max_samples) n = max_samples;
 
-    /* Nombre de samples complets */
-    n = count / FIFO_PACKET_SIZE;
-    if (n > max_samples)
-        n = max_samples;
-
-    /* Lecture burst du FIFO */
     for (int i = 0; i < n; i++) {
         uint8_t buf[FIFO_PACKET_SIZE];
 
@@ -555,14 +624,47 @@ int icm20948_fifo_read(spi_device_t *spi,
                                 buf, FIFO_PACKET_SIZE) < 0)
             return -1;
 
-        /* Reconstruction int16 big-endian */
+        /*
+         * Structure paquet (20 octets) :
+         *  [0- 5] accel X/Y/Z  big-endian
+         *  [6-11] gyro  X/Y/Z  big-endian
+         *  [12]   ST1           (DRDY bit0)
+         *  [13]   MAG_XL  ─┐
+         *  [14]   MAG_XH   │  little-endian (AK09916)
+         *  [15]   MAG_YL   │
+         *  [16]   MAG_YH   │
+         *  [17]   MAG_ZL   │
+         *  [18]   MAG_ZH  ─┘
+         *  [19]   ST2          (HOFL bit3)
+         * [20]   TEMP           (optionnel, pas dans FIFO si FIFO_EN2_TEMP_FIFO=0)
+         * [21]   TEMP           (optionnel, pas dans FIFO si FIFO_EN2_TEMP_FIFO=0)
+         */
+
+        /* Accel — big-endian */
         samples[i].accel_x = (int16_t)((buf[0]  << 8) | buf[1]);
         samples[i].accel_y = (int16_t)((buf[2]  << 8) | buf[3]);
         samples[i].accel_z = (int16_t)((buf[4]  << 8) | buf[5]);
+
+        /* Gyro — big-endian */
         samples[i].gyro_x  = (int16_t)((buf[6]  << 8) | buf[7]);
         samples[i].gyro_y  = (int16_t)((buf[8]  << 8) | buf[9]);
         samples[i].gyro_z  = (int16_t)((buf[10] << 8) | buf[11]);
-        samples[i].temp    = (int16_t)((buf[12] << 8) | buf[13]);
+
+        /* Compass status */
+        samples[i].mag_st1 = buf[12];
+        samples[i].mag_st2 = buf[19];
+
+        /* Mag — little-endian (AK09916) */
+        samples[i].mag_x   = (int16_t)((buf[14] << 8) | buf[13]);
+        samples[i].mag_y   = (int16_t)((buf[16] << 8) | buf[15]);
+        samples[i].mag_z   = (int16_t)((buf[18] << 8) | buf[17]);
+
+        /* Données mag valides si DRDY=1 et pas d'overflow */
+        samples[i].mag_valid = ((samples[i].mag_st1 & 0x01) &&
+                                !(samples[i].mag_st2 & 0x08)) ? 1 : 0;
+
+        /*temperature - big-endian*/
+        samples[i].temp    = (int16_t)((buf[20] << 8) | buf[21]);
     }
 
     *nb_read = n;
@@ -590,4 +692,136 @@ void icm20948_convert(const icm20948_sample_t *raw,
     *ay = raw->accel_y * accel_scale;
     *az = raw->accel_z * accel_scale;
     *temp =  (raw->temp / 333.87f) + 21.0f;  /* °C */ /// 333.87f + 21.0f
+}
+/* ------------------------------------------------------------------ */
+/* Écriture vers AK09916 via SLV0 (one-shot)                          */
+/* ------------------------------------------------------------------ */
+static int ak09916_write(spi_device_t *spi, uint8_t reg, uint8_t val)
+{
+    icm20948_set_bank(spi, BANK_3);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_ADDR, AK09916_I2C_ADDR);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_REG,  reg);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_DO,   val);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_CTRL, (1 << 7) | 1);
+
+    icm20948_set_bank(spi, BANK_0);
+    usleep(10000);  /* attendre transaction I2C */
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Lecture depuis AK09916 via SLV0 avec retry                         */
+/* ------------------------------------------------------------------ */
+static int ak09916_read(spi_device_t *spi, uint8_t reg,
+                        uint8_t *buf, uint8_t len)
+{
+    uint8_t status;
+
+    icm20948_set_bank(spi, BANK_3);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_ADDR,
+                       AK09916_I2C_ADDR | 0x80);   /* bit7=1 → lecture */
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_REG,  reg);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_CTRL, (1 << 7) | len);
+    icm20948_set_bank(spi, BANK_0);
+
+    /* Retry : attendre que le I2C master remonte les données */
+    for (int i = 0; i < 10; i++) {
+        usleep(20000);  /* 20 ms */
+
+        icm20948_read_reg(spi, ICM20948_I2C_MST_STATUS, &status);
+        if (status & (1 << 4)) {
+            fprintf(stderr, "ak09916_read: NACK sur reg=0x%02X\n", reg);
+            return -1;
+        }
+
+        icm20948_read_burst(spi, ICM20948_EXT_SLV_SENS_DATA_00, buf, len);
+
+        /* Valide si au moins un octet non nul */
+        for (int j = 0; j < len; j++) {
+            if (buf[j] != 0x00)
+                return 0;
+        }
+    }
+
+    fprintf(stderr, "ak09916_read: données toujours nulles après 10 essais\n");
+    return -1;
+}
+static int init_compass(spi_device_t *spi)
+{
+    uint8_t val, d[2];
+
+    /* ── 1. Activer I2C master en préservant I2C_IF_DIS ── */
+    icm20948_set_bank(spi, BANK_0);
+    icm20948_read_reg(spi, ICM20948_USER_CTRL, &val);
+
+    val |= USER_CTRL_I2C_MST_EN
+        |  USER_CTRL_I2C_IF_DIS
+        |  USER_CTRL_I2C_MST_RST;   /* reset bus I2C */
+    icm20948_write_reg(spi, ICM20948_USER_CTRL, val);
+    usleep(10000);
+
+    val &= ~USER_CTRL_I2C_MST_RST;  /* relâcher reset */
+    icm20948_write_reg(spi, ICM20948_USER_CTRL, val);
+    usleep(10000);
+
+    /* ── 2. Configurer I2C master ── */
+    icm20948_set_bank(spi, BANK_3);
+
+    /* 0x17 : 400 kHz + MULT_MST_EN */
+    icm20948_write_reg(spi, ICM20948_I2C_MST_CTRL, 0x17);
+
+    /* ODR I2C master : 1100 / 2^4 = 68 Hz */
+    icm20948_write_reg(spi, ICM20948_I2C_MST_ODR_CFG, 0x04);
+
+    /* Activer delay sur SLV0 */
+    icm20948_write_reg(spi, ICM20948_I2C_MST_DELAY_CTRL, (1 << 7) | 1);
+
+    icm20948_set_bank(spi, BANK_0);
+    usleep(10000);
+
+    /* ── 3. Vérifier WHO_AM_I AK09916 (WIA1+WIA2) ── */
+    if (ak09916_read(spi, AK09916_WIA1, d, 2) < 0)
+        return -1;
+
+    printf("[INIT] AK09916 WIA1=0x%02X (att. 0x48)  "
+                        "WIA2=0x%02X (att. 0x09)",
+           d[0], d[1]);
+
+    if (d[0] != 0x48 || d[1] != 0x09) {
+        printf(" ✗\n");
+        return -1;
+    }
+    printf(" ✓\n");
+
+    /* ── 4. Reset soft AK09916 ── */
+    ak09916_write(spi, AK09916_CNTL3, 0x01);
+    usleep(10000);
+
+    /* ── 5. Mode continu 100 Hz ── */
+    ak09916_write(spi, AK09916_CNTL2, AK09916_MODE_CONT_100HZ);
+    usleep(10000);
+
+    /* Vérifier que le mode a bien été écrit */
+    uint8_t mode = 0;
+    ak09916_read(spi, AK09916_CNTL2, &mode, 1);
+    if ((mode & 0x1F) != AK09916_MODE_CONT_100HZ) {
+        fprintf(stderr, "[INIT] AK09916 CNTL2: attendu 0x%02X, lu 0x%02X\n",
+                AK09916_MODE_CONT_100HZ, mode);
+        return -1;
+    }
+
+    /* ── 6. Configurer SLV0 en lecture automatique ── */
+    /*    Lecture cyclique : ST1(1) + HX(2) + HY(2) + HZ(2) + ST2(1) */
+    icm20948_set_bank(spi, BANK_3);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_ADDR,
+                       AK09916_I2C_ADDR | 0x80);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_REG,
+                       AK09916_ST1);                   /* 0x10 */
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_CTRL,
+                       (1 << 7) | AK09916_SLV0_LEN);  /* EN + 8 octets */
+    icm20948_set_bank(spi, BANK_0);
+
+    printf("[INIT] Compass AK09916 : mode continu 100 Hz  "
+           "SLV0 lecture %d octets/cycle ✓\n", AK09916_SLV0_LEN);
+    return 0;
 }
