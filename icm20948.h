@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
 
 #include "spi_custom.h"
 //#include "AK09916.h"
@@ -32,9 +33,12 @@
 /* Bank 2 */
 #define ICM20948_GYRO_SMPLRT_DIV   0x00
 #define ICM20948_GYRO_CONFIG_1     0x01
+#define ICM20948_GYRO_CONFIG_2     0x02
 #define ICM20948_ACCEL_SMPLRT_DIV1 0x10
 #define ICM20948_ACCEL_SMPLRT_DIV2 0x11
 #define ICM20948_ACCEL_CONFIG      0x14
+#define ICM20948_ACCEL_CONFIG_2    0x15
+#define ICM20948_TEMP_CONFIG       0x53
 
 
 
@@ -79,7 +83,7 @@
 #define FIFO_EN2_GYRO_Y        (1 << 2)
 #define FIFO_EN2_GYRO_X        (1 << 1)
 #define FIFO_EN2_TEMP_FIFO     (1 << 0)
-#define FIFO_EN1_SLV0           (1 << 0) /* compass via SLV0 → FIFO */
+#define FIFO_EN1_SLV0          (1 << 0) /* compass via SLV0 → FIFO */
 
 /* GYRO_CONFIG_1 */
 #define GYRO_FCHOICE_ENABLE    (1 << 0)
@@ -109,12 +113,27 @@
 #define ACCEL_DLPF_6HZ         (6 << 3)
 
 /* Taille paquet FIFO */
-//#define FIFO_PACKET_SIZE       14   /* accel(6) + gyro(6) + temp*/
-#define FIFO_PACKET_SIZE       22   /* accel(6)+gyro(6)+ST1(1)+mag(6)+ST2(1)+temp */
-#define FIFO_MAX_PACKETS       23   /* 512 / 22           */
+/*
+ * Paquet FIFO avec 9 octets compass :
+ *  [0 - 5]  accel X/Y/Z      big-endian
+ *  [6 -11]  gyro  X/Y/Z      big-endian
+ *  [12]     ST1
+ *  [13]     MAG_XL  ─┐
+ *  [14]     MAG_XH   │ little-endian
+ *  [15]     MAG_YL   │
+ *  [16]     MAG_YH   │
+ *  [17]     MAG_ZL   │
+ *  [18]     MAG_ZH  ─┘
+ *  [19]     gap (0x00)        ← octet 0x17, vide
+ *  [20]     ST2
+ * ─────────────────────────────────────
+ * Total : 21 octets
+ */
+#define FIFO_PACKET_SIZE       23   /* accel(6)+gyro(6)+ST1(1)+mag(6)+ST2(1)+temp */
+#define FIFO_MAX_PACKETS       22   /* 512 / 22           */
 
 /* ================================================================== */
-/* AK09916                                                             */
+/* AK09916  (La boussole intégrée)                                    */
 /* ================================================================== */
 #define AK09916_I2C_ADDR        0x0C
 #define AK09916_WIA1            0x00   /* Company ID = 0x48 */
@@ -143,8 +162,196 @@
 #define ICM20948_I2C_SLV0_CTRL      0x05
 #define ICM20948_I2C_SLV0_DO        0x06
 
+/*
+* Declaration des valeurs pour les differents filtres
+*/
+/* ================================================================== */
+/* GYRO DLPF — FCHOICE=1 requis                                       */
+/* ================================================================== */
+/*
+ *  CFG  Bandwidth   Noise   Délai
+ *   0    196.6 Hz   élevé   0.6 ms
+ *   1    151.8 Hz     ↓     1.1 ms
+ *   2    119.5 Hz     ↓     1.9 ms
+ *   3     51.2 Hz     ↓     4.5 ms   ← bon équilibre
+ *   4     23.9 Hz     ↓     8.9 ms
+ *   5     11.6 Hz     ↓    17.0 ms
+ *   6      5.7 Hz   faible 33.5 ms   ← très filtré
+ *   7    361.4 Hz   élevé   0.3 ms
+ */
+#define GYRO_DLPF_197HZ    (0 << 3)
+#define GYRO_DLPF_152HZ    (1 << 3)
+#define GYRO_DLPF_120HZ    (2 << 3)
+#define GYRO_DLPF_51HZ     (3 << 3)   /* recommandé usage général */
+#define GYRO_DLPF_24HZ     (4 << 3)   /* recommandé vibrations    */
+#define GYRO_DLPF_12HZ     (5 << 3)
+#define GYRO_DLPF_6HZ      (6 << 3)   /* très stable, latence max */
+#define GYRO_DLPF_361HZ    (7 << 3)
 
-static int icm20948_set_bank(spi_device_t *spi, uint8_t bank);
+/* ================================================================== */
+/* GYRO AVERAGING — mode low power uniquement                         */
+/* ================================================================== */
+/*
+ *  CFG  Nb moyennes
+ *   0     1  (pas de moyennage)
+ *   1     2
+ *   2     4
+ *   3     8
+ *   4    16
+ *   5    32
+ *   6    64
+ *   7   128                    ← maximum
+ */
+#define GYRO_AVG_1X     0
+#define GYRO_AVG_2X     1
+#define GYRO_AVG_4X     2
+#define GYRO_AVG_8X     3
+#define GYRO_AVG_16X    4
+#define GYRO_AVG_32X    5
+#define GYRO_AVG_64X    6
+#define GYRO_AVG_128X   7
+
+/* ================================================================== */
+/* ACCEL DLPF — FCHOICE=1 requis                                      */
+/* ================================================================== */
+/*
+ *  CFG  Bandwidth   Délai
+ *   0    246.0 Hz   1.0 ms
+ *   1    246.0 Hz   1.0 ms
+ *   2    111.4 Hz   2.9 ms
+ *   3     50.4 Hz   5.9 ms   ← bon équilibre
+ *   4     23.9 Hz  11.5 ms
+ *   5     11.5 Hz  23.0 ms
+ *   6      5.7 Hz  45.9 ms   ← très filtré
+ *   7    473.0 Hz   0.6 ms
+ */
+#define ACCEL_DLPF_246HZ   (0 << 3)
+#define ACCEL_DLPF_111HZ   (2 << 3)
+#define ACCEL_DLPF_50HZ    (3 << 3)   /* recommandé usage général */
+#define ACCEL_DLPF_24HZ    (4 << 3)   /* recommandé vibrations    */
+#define ACCEL_DLPF_12HZ    (5 << 3)
+#define ACCEL_DLPF_6HZ     (6 << 3)
+#define ACCEL_DLPF_473HZ   (7 << 3)
+
+/* ================================================================== */
+/* ACCEL DECIMATION — moyennage hardware                              */
+/* ================================================================== */
+/*
+ *  CFG  Nb échantillons moyennés
+ *   0     4  (défaut)
+ *   1     8
+ *   2    16
+ *   3    32                    ← maximum
+ */
+#define ACCEL_DEC3_4X    0
+#define ACCEL_DEC3_8X    1
+#define ACCEL_DEC3_16X   2
+#define ACCEL_DEC3_32X   3
+
+/* ================================================================== */
+/* TEMP DLPF                                                          */
+/* ================================================================== */
+/*
+ *  CFG  Bandwidth   Délai
+ *   0    7932 Hz    0.1 ms
+ *   1     217 Hz    1.0 ms
+ *   2     123 Hz    2.0 ms
+ *   3      66 Hz    3.0 ms
+ *   4      34 Hz    5.0 ms
+ *   5      17 Hz    9.0 ms
+ *   6       9 Hz   17.0 ms
+ *   7       9 Hz   17.0 ms
+ */
+#define TEMP_DLPF_7932HZ   0
+#define TEMP_DLPF_217HZ    1
+#define TEMP_DLPF_123HZ    2
+#define TEMP_DLPF_66HZ     3
+#define TEMP_DLPF_34HZ     4
+#define TEMP_DLPF_17HZ     5
+#define TEMP_DLPF_9HZ      6
+
+/* ================================================================== */
+/* PRESETS de configurations    
+## Guide de choix
+```
+Symptôme                    → Solution
+──────────────────────────────────────────────────────
+Valeurs gyro qui tremblent  → GYRO_DLPF_24HZ + AVG_8X
+Vibrations mécaniques       → ACCEL_DLPF_24HZ + DEC3_16X
+Latence trop élevée         → DLPF plus élevé (120Hz+)
+Données gyro saturent       → GYRO_FS plus grand
+Données accel saturent      → ACCEL_FS plus grand
+Bruit résiduel après DLPF   → augmenter AVG ou DEC3                                      */
+/* ================================================================== */
+typedef struct {
+    const char *name;
+    uint8_t  gyro_fs;
+    uint8_t  gyro_dlpf;
+    uint8_t  gyro_avg;
+    uint8_t  gyro_smplrt_div;
+    uint8_t  accel_fs;
+    uint8_t  accel_dlpf;
+    uint8_t  accel_dec3;
+    uint16_t accel_smplrt_div;
+    uint8_t  temp_dlpf;
+
+    /* FIFO */
+    uint8_t  fifo_mode;        /* 0=stream, 1=stop-on-full */
+} icm20948_filter_preset_t;
+
+/*
+ * PRESET 1 — Drone / robot rapide
+ *   Priorité : faible latence, bande passante large
+ */
+static const icm20948_filter_preset_t PRESET_FAST = {
+    .name             = "FAST (drone/robot)",
+    .gyro_fs          = GYRO_FS_500DPS,
+    .gyro_dlpf        = GYRO_DLPF_120HZ,
+    .gyro_avg         = GYRO_AVG_1X,
+    .gyro_smplrt_div  = 0x04,          /* ODR = 225 Hz */
+    .accel_fs         = ACCEL_FS_4G,
+    .accel_dlpf       = ACCEL_DLPF_111HZ,
+    .accel_dec3       = ACCEL_DEC3_4X,
+    .accel_smplrt_div = 0x04,          /* ODR = 225 Hz */
+    .temp_dlpf        = TEMP_DLPF_123HZ,
+    .fifo_mode        = 0,                    /* stream (overwrite) */
+};
+
+/*
+ * PRESET 2 — Navigation / stabilisation
+ *   Priorité : équilibre latence/bruit
+ */
+static const icm20948_filter_preset_t PRESET_BALANCED = {
+    .name             = "BALANCED (navigation)",
+    .gyro_fs          = GYRO_FS_500DPS,
+    .gyro_dlpf        = GYRO_DLPF_51HZ,
+    .gyro_avg         = GYRO_AVG_4X,
+    .gyro_smplrt_div  = 0x09,          /* ODR = 112.5 Hz */
+    .accel_fs         = ACCEL_FS_4G,
+    .accel_dlpf       = ACCEL_DLPF_50HZ,
+    .accel_dec3       = ACCEL_DEC3_8X,
+    .accel_smplrt_div = 0x09,          /* ODR = 112.5 Hz */
+    .temp_dlpf        = TEMP_DLPF_66HZ,
+    .fifo_mode        = 0,                    /* stream (overwrite) */
+};
+
+/*
+ * PRESET 3 — Données statiques / faible bruit
+ *   Priorité : minimum de bruit, latence non critique
+ */
+static const icm20948_filter_preset_t PRESET_STABLE = {
+    .name             = "STABLE (faible bruit)",
+    .gyro_fs          = GYRO_FS_250DPS,
+    .gyro_dlpf        = GYRO_DLPF_24HZ,
+    .gyro_avg         = GYRO_AVG_32X,
+    .gyro_smplrt_div  = 0x15,          /* ODR = 50 Hz */
+    .accel_fs         = ACCEL_FS_2G,
+    .accel_dlpf       = ACCEL_DLPF_24HZ,
+    .accel_dec3       = ACCEL_DEC3_32X,
+    .accel_smplrt_div = 0x15,          /* ODR = 50 Hz */
+    .temp_dlpf        = TEMP_DLPF_17HZ,
+    .fifo_mode        = 0,                    /* stream (overwrite) */
+};
 
 /* ── Structure d'un sample ───────────────────────────────────────── */
 typedef struct {
@@ -161,20 +368,99 @@ typedef struct {
     int fd;           /* descripteur /dev/spidevX.Y */
 } ICM20948;
 
-typedef struct {
-    /* Gyro */
-    uint8_t  gyro_fs;          /* GYRO_FS_xxx      */
-    uint8_t  gyro_dlpf;        /* GYRO_DLPF_xxxHZ  */
-    uint8_t  gyro_smplrt_div;  /* 0x00 à 0xFF      */
+/*
+ * Declaration des fonctions d'accès au capteur ICM-20948
+ */
+static int icm20948_set_bank(spi_device_t *spi, uint8_t bank);
+static int icm20948_read_reg(spi_device_t *spi, uint8_t reg, uint8_t *val);
+static int icm20948_read_burst(spi_device_t *spi, uint8_t reg,
+                               uint8_t *buf, size_t len);
+static int icm20948_write_reg(spi_device_t *spi, uint8_t reg, uint8_t val);
+static int init_compass(spi_device_t *spi);
+int icm20948_who_am_i(spi_device_t *spi);
+int icm20948_init(spi_device_t *spi, const icm20948_filter_preset_t *cfg);
+int icm20948_filter_apply(spi_device_t *spi,
+                          const icm20948_filter_preset_t *p);
+void icm20948_convert(const icm20948_sample_t *sample,
+                        float *gx, float *gy, float *gz,
+                        float *ax, float *ay, float *az,
+                        float *compx, float *compy, float *compz,
+                        float *cap, float *temp);
 
-    /* Accel */
-    uint8_t  accel_fs;         /* ACCEL_FS_xG      */
-    uint8_t  accel_dlpf;       /* ACCEL_DLPF_xxxHZ */
-    uint16_t accel_smplrt_div; /* 0x000 à 0xFFF    */
+/*
+    * Applique un preset de filtrage (DLPF, moyennage, ODR) sur le capteur.
+    * Retourne 0 en cas de succès, -1 en cas d'erreur.  
+*/
+int icm20948_filter_apply(spi_device_t *spi,
+                          const icm20948_filter_preset_t *p)
+{
+    uint8_t val;
+    int     ret = 0;
 
-    /* FIFO */
-    uint8_t  fifo_mode;        /* 0=stream, 1=stop-on-full */
-} icm20948_config_t;
+    printf("[FILTER] Application preset : %s\n", p->name);
+
+    /* ── Bank 2 ── */
+    ret = icm20948_set_bank(spi, BANK_2);
+    if (ret < 0) return -1;
+
+    /* GYRO_CONFIG_1 : FCHOICE + FS + DLPF */
+    val = GYRO_FCHOICE_ENABLE | p->gyro_fs | p->gyro_dlpf;
+    ret = icm20948_write_reg(spi, ICM20948_GYRO_CONFIG_1, val);
+    if (ret < 0) return -1;
+    printf("[FILTER] GYRO_CONFIG_1  = 0x%02X "
+           "(FCHOICE=1 FS=0x%02X DLPF=0x%02X)\n",
+           val, p->gyro_fs >> 1, p->gyro_dlpf >> 3);
+
+    /* GYRO_CONFIG_2 : averaging */
+    val = p->gyro_avg & 0x07;
+    ret = icm20948_write_reg(spi, ICM20948_GYRO_CONFIG_2, val);
+    if (ret < 0) return -1;
+    printf("[FILTER] GYRO_CONFIG_2  = 0x%02X (AVG=%dx)\n",
+           val, 1 << p->gyro_avg);
+
+    /* GYRO_SMPLRT_DIV */
+    ret = icm20948_write_reg(spi, ICM20948_GYRO_SMPLRT_DIV,
+                             p->gyro_smplrt_div);
+    if (ret < 0) return -1;
+    printf("[FILTER] GYRO ODR       = %.1f Hz\n",
+           1125.0f / (1 + p->gyro_smplrt_div));
+
+    /* ACCEL_CONFIG : FCHOICE + FS + DLPF */
+    val = ACCEL_FCHOICE_ENABLE | p->accel_fs | p->accel_dlpf;
+    ret = icm20948_write_reg(spi, ICM20948_ACCEL_CONFIG, val);
+    if (ret < 0) return -1;
+    printf("[FILTER] ACCEL_CONFIG   = 0x%02X "
+           "(FCHOICE=1 FS=0x%02X DLPF=0x%02X)\n",
+           val, p->accel_fs >> 1, p->accel_dlpf >> 3);
+
+    /* ACCEL_CONFIG_2 : decimation */
+    val = p->accel_dec3 & 0x07;
+    ret = icm20948_write_reg(spi, ICM20948_ACCEL_CONFIG_2, val);
+    if (ret < 0) return -1;
+    printf("[FILTER] ACCEL_CONFIG_2 = 0x%02X (DEC3=%dx)\n",
+           val, 4 << p->accel_dec3);
+
+    /* ACCEL_SMPLRT_DIV sur 12 bits */
+    ret = icm20948_write_reg(spi, ICM20948_ACCEL_SMPLRT_DIV1,
+                             (p->accel_smplrt_div >> 8) & 0x0F);
+    if (ret < 0) return -1;
+    ret = icm20948_write_reg(spi, ICM20948_ACCEL_SMPLRT_DIV2,
+                             p->accel_smplrt_div & 0xFF);
+    if (ret < 0) return -1;
+    printf("[FILTER] ACCEL ODR      = %.1f Hz\n",
+           1125.0f / (1 + p->accel_smplrt_div));
+
+    /* TEMP_CONFIG */
+    ret = icm20948_write_reg(spi, ICM20948_TEMP_CONFIG,
+                             p->temp_dlpf & 0x07);
+    if (ret < 0) return -1;
+    printf("[FILTER] TEMP_CONFIG    = 0x%02X\n", p->temp_dlpf);
+
+    icm20948_set_bank(spi, BANK_0);
+
+    printf("[FILTER] Preset appliqué ✓\n");
+    return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* Permet de changer de bank, toujours revenir sur la bank 0          */
@@ -384,62 +670,6 @@ static int init_power(spi_device_t *spi)
     return 0;
 }
 
-/* ── 4. Configuration gyroscope ──────────────────────────────────── */
-static int init_gyro(spi_device_t *spi, const icm20948_config_t *cfg)
-{
-    uint8_t val;
-
-    icm20948_set_bank(spi, BANK_2);
-
-    /* GYRO_CONFIG_1 : FCHOICE + FS + DLPF */
-    val = GYRO_FCHOICE_ENABLE | cfg->gyro_fs | cfg->gyro_dlpf;
-    if (icm20948_write_reg(spi, ICM20948_GYRO_CONFIG_1, val) < 0)
-        return -1;
-
-    /* GYRO_SMPLRT_DIV */
-    if (icm20948_write_reg(spi, ICM20948_GYRO_SMPLRT_DIV,
-                           cfg->gyro_smplrt_div) < 0)
-        return -1;
-
-    icm20948_set_bank(spi, BANK_0);
-
-    printf("[INIT] Gyro : FS=0x%02X  DLPF=0x%02X  "
-           "ODR=%.1f Hz\n",
-           cfg->gyro_fs, cfg->gyro_dlpf,
-           1125.0f / (1 + cfg->gyro_smplrt_div));
-    return 0;
-}
-
-/* ── 5. Configuration accéléromètre ──────────────────────────────── */
-static int init_accel(spi_device_t *spi, const icm20948_config_t *cfg)
-{
-    uint8_t val;
-
-    icm20948_set_bank(spi, BANK_2);
-
-    /* ACCEL_CONFIG : FCHOICE + FS + DLPF */
-    val = ACCEL_FCHOICE_ENABLE | cfg->accel_fs | cfg->accel_dlpf;
-    if (icm20948_write_reg(spi, ICM20948_ACCEL_CONFIG, val) < 0)
-        return -1;
-
-    /* ACCEL_SMPLRT_DIV sur 12 bits → 2 registres */
-    uint8_t div_h = (cfg->accel_smplrt_div >> 8) & 0x0F;
-    uint8_t div_l =  cfg->accel_smplrt_div & 0xFF;
-
-    if (icm20948_write_reg(spi, ICM20948_ACCEL_SMPLRT_DIV1, div_h) < 0)
-        return -1;
-    if (icm20948_write_reg(spi, ICM20948_ACCEL_SMPLRT_DIV2, div_l) < 0)
-        return -1;
-
-    icm20948_set_bank(spi, BANK_0);
-
-    printf("[INIT] Accel : FS=0x%02X  DLPF=0x%02X  "
-           "ODR=%.1f Hz\n",
-           cfg->accel_fs, cfg->accel_dlpf,
-           1125.0f / (1 + cfg->accel_smplrt_div));
-    return 0;
-}
-
 void icm20948_fifo_debug(spi_device_t *spi)
 {
     uint8_t user_ctrl, fifo_en1, fifo_en2;
@@ -477,7 +707,7 @@ void icm20948_fifo_debug(spi_device_t *spi)
 }
 
 /* ── 6. Initialisation FIFO ──────────────────────────────────────── */
-static int init_fifo(spi_device_t *spi, const icm20948_config_t *cfg)
+static int init_fifo(spi_device_t *spi, const icm20948_filter_preset_t *cfg)
 {
     uint8_t val;
 
@@ -563,16 +793,21 @@ static int init_fifo(spi_device_t *spi, const icm20948_config_t *cfg)
     return 0;
 }
 
-int icm20948_init(spi_device_t *spi, const icm20948_config_t *cfg)
+int icm20948_init(spi_device_t *spi, const icm20948_filter_preset_t *cfg)
 {
+    printf("=== ICM-20948 Init ===\n");
+
+    uint8_t tx[2] = { 0xFF, 0xFF }, rx[2];
+    spi_transfer(spi, tx, rx, 2);
+    usleep(1000);
     //On se positionne sur la bank 0
     icm20948_set_bank(spi, BANK_0);
 
        if (init_reset(spi)         < 0) return -1;
-//    if (init_check_whoami(spi)  < 0) return -1;  /* re-vérif post-reset */
+    if (icm20948_who_am_i(spi)  < 0) return -1;  /* re-vérif post-reset */
     if (init_power(spi)         < 0) return -1;
-    if (init_gyro(spi, cfg)     < 0) return -1;
-    if (init_accel(spi, cfg)    < 0) return -1;
+    if (icm20948_filter_apply(spi, cfg) < 0) return -1;
+    if(init_compass(spi)   < 0) return -1;
     if (init_fifo(spi, cfg)     < 0) return -1;
 
     printf("=== Init terminée ===\n");
@@ -635,9 +870,10 @@ uint8_t h, l;
          *  [16]   MAG_YH   │
          *  [17]   MAG_ZL   │
          *  [18]   MAG_ZH  ─┘
-         *  [19]   ST2          (HOFL bit3)
-         * [20]   TEMP           (optionnel, pas dans FIFO si FIFO_EN2_TEMP_FIFO=0)
+         *  [19]   gap
+         *  [20]   st2          (HOFL bit3)
          * [21]   TEMP           (optionnel, pas dans FIFO si FIFO_EN2_TEMP_FIFO=0)
+         * [22]   TEMP           (optionnel, pas dans FIFO si FIFO_EN2_TEMP_FIFO=0)
          */
 
         /* Accel — big-endian */
@@ -652,7 +888,7 @@ uint8_t h, l;
 
         /* Compass status */
         samples[i].mag_st1 = buf[12];
-        samples[i].mag_st2 = buf[19];
+        samples[i].mag_st2 = buf[20];
 
         /* Mag — little-endian (AK09916) */
         samples[i].mag_x   = (int16_t)((buf[14] << 8) | buf[13]);
@@ -664,7 +900,7 @@ uint8_t h, l;
                                 !(samples[i].mag_st2 & 0x08)) ? 1 : 0;
 
         /*temperature - big-endian*/
-        samples[i].temp    = (int16_t)((buf[20] << 8) | buf[21]);
+        samples[i].temp    = (int16_t)((buf[21] << 8) | buf[22]);
     }
 
     *nb_read = n;
@@ -676,13 +912,23 @@ uint8_t h, l;
 /* ------------------------------------------------------------------ */
 void icm20948_convert(const icm20948_sample_t *raw,
                       float *gx, float *gy, float *gz,
-                      float *ax, float *ay, float *az, float *temp)
+                      float *ax, float *ay, float *az,
+                      float *compx, float *compy, float *compz,
+                      float *cap,
+                       float *temp)
 {
     /* Sensibilité gyro pour ±500°/s */
     const float gyro_scale  = 1.0f / 65.5f;   /* °/s par LSB */
 
     /* Sensibilité accel pour ±4g */
     const float accel_scale = 1.0f / 8192.0f;  /* g par LSB  */
+
+    /*La sensibilité du AK09916 est 0.15 µT/LSB*/
+    *compx = raw->mag_x * 0.15f;
+    *compy = raw->mag_y * 0.15f;
+    *compz = raw->mag_z * 0.15f;
+    *cap = atan2f(*compy, *compx) * (180.0f / M_PI); //M_PI est défini dans math.h
+    if (*cap < 0) *cap += 360.0f;
 
     *gx = raw->gyro_x  * gyro_scale;
     *gy = raw->gyro_y  * gyro_scale;
@@ -746,6 +992,25 @@ static int ak09916_read(spi_device_t *spi, uint8_t reg,
     fprintf(stderr, "ak09916_read: données toujours nulles après 10 essais\n");
     return -1;
 }
+
+static int init_compass_slv0(spi_device_t *spi)
+{
+    icm20948_set_bank(spi, BANK_3);
+
+    /* Lecture depuis ST1 (0x10), 9 octets */
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_ADDR,
+                       AK09916_I2C_ADDR | 0x80);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_REG,  AK09916_ST1);
+    icm20948_write_reg(spi, ICM20948_I2C_SLV0_CTRL,
+                       (1 << 7) | AK09916_SLV0_LEN);
+
+    icm20948_set_bank(spi, BANK_0);
+
+    printf("[INIT] SLV0 : lecture %d octets depuis ST1 (0x10) "
+           "→ ST2 inclus ✓\n", AK09916_SLV0_LEN);
+    return 0;
+}
+
 static int init_compass(spi_device_t *spi)
 {
     uint8_t val, d[2];
@@ -797,11 +1062,15 @@ static int init_compass(spi_device_t *spi)
     ak09916_write(spi, AK09916_CNTL3, 0x01);
     usleep(10000);
 
-    /* ── 5. Mode continu 100 Hz ── */
+    /* ── 5. Power down explicite avant de changer de mode ── */
+    ak09916_write(spi, AK09916_CNTL2, AK09916_MODE_POWERDOWN);
+    usleep(10000);
+
+    /* ── 6. Mode continu 100 Hz ── */
     ak09916_write(spi, AK09916_CNTL2, AK09916_MODE_CONT_100HZ);
     usleep(10000);
 
-    /* Vérifier que le mode a bien été écrit */
+    /* -- 7. Vérifier que le mode a bien été écrit */
     uint8_t mode = 0;
     ak09916_read(spi, AK09916_CNTL2, &mode, 1);
     if ((mode & 0x1F) != AK09916_MODE_CONT_100HZ) {
@@ -809,19 +1078,28 @@ static int init_compass(spi_device_t *spi)
                 AK09916_MODE_CONT_100HZ, mode);
         return -1;
     }
+    printf("[INIT] AK09916 CNTL2 = 0x%02X ✓\n", mode);
 
-    /* ── 6. Configurer SLV0 en lecture automatique ── */
-    /*    Lecture cyclique : ST1(1) + HX(2) + HY(2) + HZ(2) + ST2(1) */
-    icm20948_set_bank(spi, BANK_3);
-    icm20948_write_reg(spi, ICM20948_I2C_SLV0_ADDR,
-                       AK09916_I2C_ADDR | 0x80);
-    icm20948_write_reg(spi, ICM20948_I2C_SLV0_REG,
-                       AK09916_ST1);                   /* 0x10 */
-    icm20948_write_reg(spi, ICM20948_I2C_SLV0_CTRL,
-                       (1 << 7) | AK09916_SLV0_LEN);  /* EN + 8 octets */
-    icm20948_set_bank(spi, BANK_0);
+    /* ── 8. Configurer SLV0 lecture continue ── */
+    if (init_compass_slv0(spi) < 0) return -1;
+
+    /* ── 9. Attendre 2 cycles avant de vérifier ── */
+    usleep(30000);
+
+icm20948_set_bank(spi, BANK_3);
+    /* ── 10. Vérifier que DRDY remonte ── */
+    uint8_t buf[9] = {0};
+    ak09916_read(spi, AK09916_ST1, buf, 9);
+
+    if (!(buf[0] & 0x01)) {
+        fprintf(stderr, "[INIT] AK09916 DRDY=0 — capteur ne mesure pas\n");
+//        return -1;
+    }
 
     printf("[INIT] Compass AK09916 : mode continu 100 Hz  "
-           "SLV0 lecture %d octets/cycle ✓\n", AK09916_SLV0_LEN);
-    return 0;
+           "DRDY=%d  HOFL=%d ✓\n",
+           buf[0] & 0x01, (buf[8] >> 3) & 1);
+icm20948_set_bank(spi, BANK_0);
+
+           return 0;
 }
