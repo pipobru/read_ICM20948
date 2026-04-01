@@ -6,19 +6,7 @@
 int main(void)
 {
     spi_device_t spi;
-     /* Config typique drone / robot */
-    icm20948_config_t cfg = {
-        .gyro_fs         = GYRO_FS_500DPS,
-        .gyro_dlpf       = GYRO_DLPF_51HZ,
-        .gyro_smplrt_div = 0x09,          /* ODR = 112.5 Hz */
-
-        .accel_fs         = ACCEL_FS_4G,
-        .accel_dlpf       = ACCEL_DLPF_50HZ,
-        .accel_smplrt_div = 0x09,          /* ODR = 112.5 Hz */
-
-        .fifo_mode = 0,                    /* stream (overwrite) */
-    };
-
+ 
     if (spi_open(&spi, "/dev/spidev0.0", SPI_MODE_3, 8, 1000000) < 0)
         return 1;
     fprintf(
@@ -31,7 +19,7 @@ int main(void)
         return 1;
     }
 
-    if(icm20948_init(&spi, &cfg) < 0) {
+    if(icm20948_init(&spi, &PRESET_BALANCED) < 0) {
         spi_close(&spi);
         return 1;
     }
@@ -49,15 +37,20 @@ int main(void)
             break;
 
         for (int i = 0; i < nb_read; i++) {
-            float gx, gy, gz, ax, ay, az, temp;
+            float gx, gy, gz, ax, ay, az, compx, compy, compz, cap, temp;
             icm20948_convert(&samples[i],
                              &gx, &gy, &gz,
-                             &ax, &ay, &az, &temp);
+                             &ax, &ay, &az,
+                             &compx, &compy, &compz,
+                             &cap,
+                             &temp);
             fflush(stdout);
             printf("\r[%2d] Gyro: %7.2f %7.2f %7.2f °/s  "
-                   "Accel: %6.3f %6.3f %6.3f g %7.2f °C",
-                   i, gx, gy, gz, ax, ay, az, temp  );
-        }
+                   "Accel: %6.3f %6.3f %6.3f g %7.2f °C "
+                   "Compass: %6.2f %6.2f %6.2f µT "
+                   "Cap: %6.1f °   ",
+                   i, gx, gy, gz, ax, ay, az, temp, compx, compy, compz, cap);
+        } 
     }
 
     spi_close(&spi);
