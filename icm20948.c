@@ -182,6 +182,7 @@ int icm20948_who_am_i(spi_device_t *spi)
     }
 }
 
+#if 0
 int icm20948_gyro_config1_init(spi_device_t *spi,
                                 uint8_t fs_sel,
                                 uint8_t dlpf_cfg)
@@ -211,6 +212,9 @@ int icm20948_gyro_config1_init(spi_device_t *spi,
 
     return icm20948_set_bank(spi, BANK_0);
 }
+#endif
+
+#if 0
 int icm20948_gyro_smplrt_init(spi_device_t *spi, uint8_t divider)
 {
     int ret;
@@ -236,6 +240,8 @@ int icm20948_gyro_smplrt_init(spi_device_t *spi, uint8_t divider)
     /* Revenir en bank 0 */
     return icm20948_set_bank(spi, BANK_0);
 }
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Initialisation.                                                    */
 /* ------------------------------------------------------------------ */
@@ -417,7 +423,7 @@ int icm20948_init(spi_device_t *spi, const icm20948_filter_preset_t *cfg)
     //On se positionne sur la bank 0
     icm20948_set_bank(spi, BANK_0);
 
-       if (init_reset(spi)         < 0) return -1;
+    if (init_reset(spi)         < 0) return -1;
     if (icm20948_who_am_i(spi)  < 0) return -1;  /* re-vérif post-reset */
     if (init_power(spi)         < 0) return -1;
     if (icm20948_filter_apply(spi, cfg) < 0) return -1;
