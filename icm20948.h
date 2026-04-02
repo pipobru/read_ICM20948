@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <math.h>
+#include <math.h> //Bien pensser à rajouter l'option -lm lors de la compilation pour lier la librairie mathématique
 
 //#include "spi_custom.h"
 
