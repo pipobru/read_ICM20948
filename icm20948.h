@@ -8,7 +8,6 @@
 #include <math.h>
 
 #include "spi_custom.h"
-//#include "AK09916.h"
 
 /* ================================================================== */
 /* REGISTRES                                                           */
