@@ -7,7 +7,7 @@
 #include <unistd.h>
 #include <math.h>
 
-#include "spi_custom.h"
+//#include "spi_custom.h"
 
 /* ================================================================== */
 /* REGISTRES                                                           */
@@ -370,19 +370,37 @@ typedef struct {
 /*
  * Declaration des fonctions d'accès au capteur ICM-20948
  */
+int icm20948_filter_apply(spi_device_t *spi,
+                          const icm20948_filter_preset_t *p);
 static int icm20948_set_bank(spi_device_t *spi, uint8_t bank);
 static int icm20948_read_reg(spi_device_t *spi, uint8_t reg, uint8_t *val);
 static int icm20948_read_burst(spi_device_t *spi, uint8_t reg,
                                uint8_t *buf, size_t len);
 static int icm20948_write_reg(spi_device_t *spi, uint8_t reg, uint8_t val);
-static int init_compass(spi_device_t *spi);
 int icm20948_who_am_i(spi_device_t *spi);
+icm20948_gyro_config1_init(spi_device_t *spi,
+                                uint8_t fs_sel,
+                                uint8_t dlpf_cfg);
+int icm20948_gyro_smplrt_init(spi_device_t *spi, uint8_t divider);
+static int init_reset(spi_device_t *spi);
+static int init_power(spi_device_t *spi);
+void icm20948_fifo_debug(spi_device_t *spi);
+static int init_fifo(spi_device_t *spi, const icm20948_filter_preset_t *cfg);
+static int init_compass(spi_device_t *spi);
 int icm20948_init(spi_device_t *spi, const icm20948_filter_preset_t *cfg);
-int icm20948_filter_apply(spi_device_t *spi,
-                          const icm20948_filter_preset_t *p);
-void icm20948_convert(const icm20948_sample_t *sample,
-                        float *gx, float *gy, float *gz,
-                        float *ax, float *ay, float *az,
-                        float *compx, float *compy, float *compz,
-                        float *cap, float *temp);
-
+static int icm20948_fifo_count(spi_device_t *spi, uint16_t *count);
+int icm20948_fifo_read(spi_device_t *spi,
+                       icm20948_sample_t *samples,
+                       int max_samples,
+                       int *nb_read);
+void icm20948_convert(const icm20948_sample_t *raw,
+                      float *gx, float *gy, float *gz,
+                      float *ax, float *ay, float *az,
+                      float *compx, float *compy, float *compz,
+                      float *cap,
+                       float *temp);
+static int ak09916_write(spi_device_t *spi, uint8_t reg, uint8_t val);
+static int ak09916_read(spi_device_t *spi, uint8_t reg,
+                        uint8_t *buf, uint8_t len);
+static int init_compass_slv0(spi_device_t *spi);
+static int init_compass(spi_device_t *spi);
