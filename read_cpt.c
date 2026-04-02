@@ -28,6 +28,10 @@ int main(void)
     int nb_read = 0;
     icm20948_sample_t samples[nb_read];
 
+    usleep(100000);
+    icm20948_fifo_sources_debug(&spi);
+    icm20948_fifo_dump_raw(&spi);
+
       /* Boucle de lecture */
     while (1) {
         usleep(10000);  /* 10 ms */
@@ -45,7 +49,7 @@ int main(void)
                              &cap,
                              &temp);
             fflush(stdout);
-            printf("\r[%2d] Gyro: %7.2f %7.2f %7.2f °/s  "
+            printf("\n[%2d] Gyro: %7.2f %7.2f %7.2f °/s  "
                    "Accel: %6.3f %6.3f %6.3f g %7.2f °C "
                    "Compass: %6.2f %6.2f %6.2f µT "
                    "Cap: %6.1f °   ",

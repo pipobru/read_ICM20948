@@ -18,5 +18,5 @@ typedef struct {
 int spi_open(spi_device_t *spi, const char *device,
              uint8_t mode, uint8_t bits, uint32_t speed);
 void spi_close(spi_device_t *spi);
-static int spi_transfer(spi_device_t *spi,
+int spi_transfer(spi_device_t *spi,
                         const uint8_t *tx, uint8_t *rx, size_t len);

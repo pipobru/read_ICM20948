@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <math.h>
+#include <math.h> //Bien pensser à rajouter l'option -lm lors de la compilation pour lier la librairie mathématique
 
 #include "spi_custom.h"
 
@@ -39,7 +39,21 @@
 #define ICM20948_ACCEL_CONFIG_2    0x15
 #define ICM20948_TEMP_CONFIG       0x53
 
+/* Bank 3 — SLV4 one-shot */
+#define ICM20948_I2C_SLV4_ADDR   0x13
+#define ICM20948_I2C_SLV4_REG    0x14
+#define ICM20948_I2C_SLV4_CTRL   0x15
+#define ICM20948_I2C_SLV4_DO     0x16
+#define ICM20948_I2C_SLV4_DI     0x17   /* donnée reçue */
 
+/* I2C_MST_STATUS (Bank 0 0x17) */
+#define I2C_MST_STATUS_SLV4_DONE  (1 << 6)
+#define I2C_MST_STATUS_SLV4_NACK  (1 << 4)
+
+/* SLV4_CTRL */
+#define SLV4_EN                   (1 << 7)
+#define SLV4_INT_EN               (1 << 6)
+#define SLV4_REG_DIS              (1 << 5)  /* pas de sous-adresse registre */
 
 /* ================================================================== */
 /* CONSTANTES                                                          */
@@ -113,23 +127,24 @@
 
 /* Taille paquet FIFO */
 /*
- * Paquet FIFO avec 9 octets compass :
- *  [0 - 5]  accel X/Y/Z      big-endian
- *  [6 -11]  gyro  X/Y/Z      big-endian
- *  [12]     ST1
+ * Nouveau paquet FIFO sans TEMP :
+ *  [0 - 5]  Accel XYZ   big-endian    6 octets
+ *  [6 -11]  Gyro  XYZ   big-endian    6 octets
+ *  [12]     ST1                       1 octet
  *  [13]     MAG_XL  ─┐
- *  [14]     MAG_XH   │ little-endian
+ *  [14]     MAG_XH   │ little-endian  2 octets
  *  [15]     MAG_YL   │
- *  [16]     MAG_YH   │
+ *  [16]     MAG_YH   │                2 octets
  *  [17]     MAG_ZL   │
- *  [18]     MAG_ZH  ─┘
- *  [19]     gap (0x00)        ← octet 0x17, vide
- *  [20]     ST2
- * ─────────────────────────────────────
- * Total : 21 octets
+ *  [18]     MAG_ZH  ─┘                2 octets
+ *  [19]     TMPS dummy                1 octet
+ *  [20]     ST2                       1 octet
+ *  ──────────────────────────────────────────
+ *  Total : 21 octets
  */
-#define FIFO_PACKET_SIZE       23   /* accel(6)+gyro(6)+ST1(1)+mag(6)+ST2(1)+temp */
-#define FIFO_MAX_PACKETS       22   /* 512 / 22           */
+#define FIFO_PACKET_SIZE       21   /* accel(6)+gyro(6)+ST1(1)+mag(6)+ST2(1) */
+#define FIFO_MAX_PACKETS       24   /* 512 / 21           */
+#define SPI_BURST_MAX   64   /* taille max buffer burst */
 
 /* ================================================================== */
 /* AK09916  (La boussole intégrée)                                    */
@@ -137,6 +152,7 @@
 #define AK09916_I2C_ADDR        0x0C
 #define AK09916_WIA1            0x00   /* Company ID = 0x48 */
 #define AK09916_WIA2            0x01   /* Device ID  = 0x09 */
+#define AK09916_WIA2_VAL        0x09
 #define AK09916_ST1             0x10   /* Status 1 (DRDY)   */
 #define AK09916_HXL             0x11   /* Mag X LSB         */
 #define AK09916_ST2             0x18   /* Status 2 (HOFL)   */
@@ -149,8 +165,22 @@
 #define AK09916_MODE_CONT_50HZ  0x06
 #define AK09916_MODE_CONT_100HZ 0x08
 
-/* SLV0 lit ST1+HX+HY+HZ+ST2 = 8 octets depuis AK09916_ST1 */
-#define AK09916_SLV0_LEN        8
+/* ── 1. SLV0_LEN = 9 pour inclure ST2 ── */
+/*
+ * Registres AK09916 lus par SLV0 :
+ *  0x10  ST1    ← 1 octet  DRDY + DOR
+ *  0x11  HXL   ─┐
+ *  0x12  HXH    │ 6 octets  little-endian
+ *  0x13  HYL    │
+ *  0x14  HYH    │
+ *  0x15  HZL    │
+ *  0x16  HZH   ─┘
+ *  0x17  TMPS  ← 1 octet  dummy (toujours 0)
+ *  0x18  ST2   ← 1 octet  HOFL  OBLIGATOIRE pour libérer buffer
+ *  ───────────────────────────────
+ *  Total : 9 octets
+ */
+#define AK09916_SLV0_LEN        9    //* ST1+HX(2)+HY(2)+HZ(2)+TMPS(1)+ST2(1) */
 
 /* Bank 3 */
 #define ICM20948_I2C_MST_ODR_CFG    0x00
@@ -370,19 +400,44 @@ typedef struct {
 /*
  * Declaration des fonctions d'accès au capteur ICM-20948
  */
+int icm20948_filter_apply(spi_device_t *spi,
+                          const icm20948_filter_preset_t *p);
 static int icm20948_set_bank(spi_device_t *spi, uint8_t bank);
 static int icm20948_read_reg(spi_device_t *spi, uint8_t reg, uint8_t *val);
 static int icm20948_read_burst(spi_device_t *spi, uint8_t reg,
                                uint8_t *buf, size_t len);
 static int icm20948_write_reg(spi_device_t *spi, uint8_t reg, uint8_t val);
-static int init_compass(spi_device_t *spi);
 int icm20948_who_am_i(spi_device_t *spi);
+//int icm20948_gyro_config1_init(spi_device_t *spi,
+//                                uint8_t fs_sel,
+//                                uint8_t dlpf_cfg);
+//int icm20948_gyro_smplrt_init(spi_device_t *spi, uint8_t divider);
+static int init_reset(spi_device_t *spi);
+static int init_power(spi_device_t *spi);
+void icm20948_fifo_debug(spi_device_t *spi);
+static int init_fifo(spi_device_t *spi, const icm20948_filter_preset_t *cfg);
+static int init_compass(spi_device_t *spi);
 int icm20948_init(spi_device_t *spi, const icm20948_filter_preset_t *cfg);
-int icm20948_filter_apply(spi_device_t *spi,
-                          const icm20948_filter_preset_t *p);
-void icm20948_convert(const icm20948_sample_t *sample,
-                        float *gx, float *gy, float *gz,
-                        float *ax, float *ay, float *az,
-                        float *compx, float *compy, float *compz,
-                        float *cap, float *temp);
-
+static int icm20948_fifo_count(spi_device_t *spi, uint16_t *count);
+int icm20948_fifo_read(spi_device_t *spi,
+                       icm20948_sample_t *samples,
+                       int max_samples,
+                       int *nb_read);
+void icm20948_convert(const icm20948_sample_t *raw,
+                      float *gx, float *gy, float *gz,
+                      float *ax, float *ay, float *az,
+                      float *compx, float *compy, float *compz,
+                      float *cap,
+                       float *temp);
+static int ak09916_write(spi_device_t *spi, uint8_t reg, uint8_t val);
+static int ak09916_read(spi_device_t *spi, uint8_t reg,
+                        uint8_t *buf, uint8_t len);
+static int init_compass_slv0(spi_device_t *spi);
+static int init_compass(spi_device_t *spi);
+void icm20948_i2c_mst_debug(spi_device_t *spi);
+static int ak09916_slv4_wait_done(spi_device_t *spi);
+static int init_i2c_master(spi_device_t *spi);
+static int ak09916_check_whoami(spi_device_t *spi);
+static int icm20948_fifo_packet_size(spi_device_t *spi);
+void icm20948_fifo_sources_debug(spi_device_t *spi);
+void icm20948_fifo_dump_raw(spi_device_t *spi);
