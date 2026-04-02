@@ -50,7 +50,7 @@ void spi_close(spi_device_t *spi)
 /* ------------------------------------------------------------------ */
 /* Transfert SPI full-duplex                                           */
 /* ------------------------------------------------------------------ */
-static int spi_transfer(spi_device_t *spi,
+int spi_transfer(spi_device_t *spi,
                         const uint8_t *tx, uint8_t *rx, size_t len)
 {
     struct spi_ioc_transfer tr = {
